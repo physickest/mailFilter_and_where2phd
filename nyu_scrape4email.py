@@ -1,8 +1,9 @@
 """
 NYU CDS Joint Faculty Email Scraper
 ====================================
-Uses Selenium (headless Chrome) to render JavaScript on each profile page
-and extract emails that are not visible in raw HTML.
+Uses Selenium (headless Chrome) to render JavaScript on each profile page,
+follows links to the professor's personal/faculty website, and extracts
+emails that are not visible in raw HTML.
 
 Requirements:
     pip install selenium webdriver-manager
@@ -24,11 +25,12 @@ import re
 import time
 import argparse
 from pathlib import Path
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-DIRECTORY_URL = "https://cds.nyu.edu/joint-faculty/"
-OUTPUT_FILE    = "nyu_joint_faculty.csv"
+DIRECTORY_URL = "https://csd.cmu.edu/people/research-tenure-faculty"
+OUTPUT_FILE    = "cmu_joint_faculty.csv"
 
 # ---------------------------------------------------------------------------
 # Selenium helpers
@@ -64,6 +66,13 @@ def _sleep():
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+# Domains that are NOT personal/faculty websites — skip these as "personal site" candidates
+_SKIP_DOMAINS = {
+    "cds.nyu.edu", "nyu.edu", "twitter.com", "x.com",
+    "linkedin.com", "github.com", "scholar.google.com",
+    "google.com", "youtube.com", "facebook.com",
+}
+
 
 def _extract_email_from_page(driver) -> str:
     """
@@ -87,7 +96,6 @@ def _extract_email_from_page(driver) -> str:
     try:
         body_text = driver.find_element(By.TAG_NAME, "body").text
         matches = EMAIL_RE.findall(body_text)
-        # Filter out generic/unrelated addresses
         for m in matches:
             if "example" not in m and "noreply" not in m:
                 return m
@@ -95,6 +103,108 @@ def _extract_email_from_page(driver) -> str:
         pass
 
     return "N/A"
+
+
+def _find_personal_website_url(driver) -> str | None:
+    """
+    On a CDS profile page, looks for a link to the professor's personal or
+    department faculty website.
+
+    Strategy:
+      1. Look for an <a> whose visible text or title contains keywords like
+         "website", "homepage", "personal site", "faculty page", etc.
+      2. Fall back to any external link (not in _SKIP_DOMAINS) that is likely
+         a university or personal academic page.
+
+    Returns the URL string, or None if nothing suitable is found.
+    """
+    from selenium.webdriver.common.by import By
+
+    PERSONAL_KEYWORDS = [
+        "website", "homepage", "personal", "faculty page",
+        "academic", "lab", "research page", "profile",
+    ]
+
+    try:
+        all_links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+    except Exception:
+        return None
+
+    candidates = []
+    for a in all_links:
+        try:
+            href = a.get_attribute("href") or ""
+            text = (a.text or "").lower().strip()
+            title = (a.get_attribute("title") or "").lower()
+            aria  = (a.get_attribute("aria-label") or "").lower()
+        except Exception:
+            continue
+
+        if not href.startswith("http"):
+            continue
+
+        parsed = urlparse(href)
+        domain = parsed.netloc.lstrip("www.")
+
+        if domain in _SKIP_DOMAINS:
+            continue
+
+        combined = f"{text} {title} {aria}"
+
+        # Explicit keyword match → high priority
+        if any(kw in combined for kw in PERSONAL_KEYWORDS):
+            return href
+
+        # Any external link that looks like a university or personal domain
+        if (
+            ".edu" in domain
+            or ".ac." in domain
+            or domain.count(".") == 1          # e.g. surname.com
+        ):
+            candidates.append(href)
+
+    return candidates[0] if candidates else None
+
+
+def _get_email_for_person(driver, profile_url: str) -> str:
+    """
+    Full two-step process for one faculty member:
+      1. Load the CDS profile page.
+      2. Try to find an email directly on the profile page.
+      3. If not found, look for a link to the personal/faculty website and
+         try to extract an email there.
+    """
+    logging.info(f"  Loading CDS profile: {profile_url}")
+    driver.get(profile_url)
+    _sleep()
+
+    # Step A — try the profile page itself first
+    email = _extract_email_from_page(driver)
+    if email != "N/A":
+        logging.info(f"  → Email found on CDS profile: {email}")
+        return email
+
+    # Step B — look for a personal/faculty website link
+    personal_url = _find_personal_website_url(driver)
+    if not personal_url:
+        logging.info("  → No personal website link found on profile page.")
+        return "N/A"
+
+    logging.info(f"  Following personal website: {personal_url}")
+    try:
+        driver.get(personal_url)
+        _sleep()
+        email = _extract_email_from_page(driver)
+    except Exception as e:
+        logging.warning(f"  Error loading personal site {personal_url}: {e}")
+        return "N/A"
+
+    if email != "N/A":
+        logging.info(f"  → Email found on personal site: {email}")
+    else:
+        logging.info("  → No email found on personal site either.")
+
+    return email
 
 
 def scrape_listing(driver) -> list[dict]:
@@ -110,7 +220,6 @@ def scrape_listing(driver) -> list[dict]:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    # Wait for at least one card to appear
     WebDriverWait(driver, 15).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "div.sp-team-pro-item"))
     )
@@ -121,8 +230,8 @@ def scrape_listing(driver) -> list[dict]:
     faculty = []
     for card in cards:
         try:
-            name_elem  = card.find_element(By.CSS_SELECTOR, "h2.sptp-name a")
-            name       = name_elem.text.strip()
+            name_elem   = card.find_element(By.CSS_SELECTOR, "h2.sptp-name a")
+            name        = name_elem.text.strip()
             profile_url = name_elem.get_attribute("href") or ""
         except Exception:
             try:
@@ -143,8 +252,8 @@ def scrape_listing(driver) -> list[dict]:
 
 def enrich_with_emails(driver, faculty: list[dict]) -> list[dict]:
     """
-    Iterates through each faculty member, visits their profile page,
-    and attempts to extract an email address.
+    Iterates through each faculty member, visits their CDS profile page,
+    follows the personal website link if needed, and extracts an email.
     """
     total = len(faculty)
     for i, person in enumerate(faculty, 1):
@@ -157,16 +266,12 @@ def enrich_with_emails(driver, faculty: list[dict]) -> list[dict]:
             logging.warning(f"[{i}/{total}] No profile URL for {person['Name']}.")
             continue
 
-        logging.info(f"[{i}/{total}] Fetching profile: {person['Name']} …")
+        logging.info(f"[{i}/{total}] Processing: {person['Name']} …")
         try:
-            driver.get(url)
-            _sleep()
-            person["Email"] = _extract_email_from_page(driver)
+            person["Email"] = _get_email_for_person(driver, url)
         except Exception as e:
-            logging.warning(f"  Error loading {url}: {e}")
+            logging.warning(f"  Unexpected error for {person['Name']}: {e}")
             person["Email"] = "N/A"
-
-        logging.info(f"  → {person['Email']}")
 
     return faculty
 
@@ -216,7 +321,7 @@ def main():
             faculty = load_existing_csv(args.resume)
         else:
             faculty = scrape_listing(driver)
-            save_csv(faculty, OUTPUT_FILE)   # save names/titles immediately
+            save_csv(faculty, OUTPUT_FILE)
 
         # Step 2 – optionally enrich with emails
         if not args.no_emails:
@@ -229,8 +334,8 @@ def main():
         driver.quit()
 
     # Summary
-    found    = sum(1 for p in faculty if p.get("Email", "N/A") != "N/A")
-    missing  = len(faculty) - found
+    found   = sum(1 for p in faculty if p.get("Email", "N/A") not in ("N/A", "", None))
+    missing = len(faculty) - found
     logging.info(f"Done. {found} emails found, {missing} still N/A.")
     logging.info(f"Results saved to: {OUTPUT_FILE}")
 
